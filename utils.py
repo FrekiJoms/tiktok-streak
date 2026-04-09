@@ -1,14 +1,14 @@
 import csv
+import importlib
+import importlib.util
 import os
 import re
 import time
 
 from dotenv import load_dotenv
-from ocacaptcha import oca_solve_captcha
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -19,11 +19,18 @@ load_dotenv()
 FRIENDS_CSV = "friends.csv"
 SELENIUM_CACHE_DIR = os.path.join(".selenium")
 REQUIRED_ENV_VARS = (
-    "CAPTCHA_API_KEY",
     "TIKTOK_USERNAME",
     "TIKTOK_PASSWORD",
     "MESSAGE",
 )
+
+
+def get_captcha_solver():
+    if importlib.util.find_spec("ocacaptcha") is None:
+        return None
+
+    module = importlib.import_module("ocacaptcha")
+    return getattr(module, "oca_solve_captcha", None)
 
 
 def validate_environment():
@@ -33,6 +40,19 @@ def validate_environment():
         raise ValueError(f"Missing required environment variables: {joined}")
 
     return os.getenv("TIKTOK_USERNAME"), os.getenv("TIKTOK_PASSWORD")
+
+
+def is_headless_enabled():
+    return os.getenv("HEADLESS", "true").strip().lower() not in {"0", "false", "no"}
+
+
+def get_login_wait_seconds():
+    return int(os.getenv("LOGIN_WAIT_SECONDS", "180"))
+
+
+def has_working_captcha_key():
+    api_key = os.getenv("CAPTCHA_API_KEY", "").strip()
+    return bool(api_key) and api_key != "api_key_ocacaptcha"
 
 
 def load_friends():
@@ -63,7 +83,8 @@ def init_browser():
 
     chrome_options = Options()
     chrome_options.add_argument("--disable-notifications")
-    chrome_options.add_argument("--headless=new")
+    if is_headless_enabled():
+        chrome_options.add_argument("--headless=new")
     try:
         browser = webdriver.Chrome(options=chrome_options)
     except WebDriverException as exc:
@@ -77,17 +98,47 @@ def init_browser():
 
 def login_tiktok(browser, wait, username, password):
     browser.get("https://www.tiktok.com/login/phone-or-email/email")
-    actions = ActionChains(browser, duration=550)
-
     try:
         wait.until(EC.presence_of_element_located((By.NAME, "username"))).send_keys(username)
         password_field = wait.until(
             EC.presence_of_element_located((By.CSS_SELECTOR, 'input[autocomplete="new-password"]'))
         )
         password_field.send_keys(password)
-        wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "tiktok-11sviba-Button-StyledButton"))).click()
+        wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))).click()
         time.sleep(3)
-        oca_solve_captcha(browser, actions, os.getenv("CAPTCHA_API_KEY"), "tiktokcircle", 10)
+
+        solver = get_captcha_solver()
+        if solver is not None and has_working_captcha_key():
+            api_key = os.getenv("CAPTCHA_API_KEY")
+            solver(browser, api_key, "tiktokcircle", 10, 20, "fast")
+        elif is_headless_enabled():
+            raise RuntimeError(
+                "No captcha solver configured and headless mode is enabled. "
+                "Set HEADLESS=false or provide CAPTCHA_API_KEY to proceed."
+            )
+        else:
+            print(
+                "Captcha solver not configured. Waiting for manual login completion in the browser."
+            )
+            try:
+                WebDriverWait(browser, get_login_wait_seconds()).until(
+                    lambda drv: "/login" not in drv.current_url.lower()
+                    and "/challenge" not in drv.current_url.lower()
+                    and "tiktok.com" in drv.current_url.lower()
+                )
+            except TimeoutException:
+                raise RuntimeError(
+                    "Manual login did not complete in time. Complete any captcha/2FA in the browser "
+                    "or set CAPTCHA_API_KEY."
+                )
+
+        time.sleep(5)
+        current_url = browser.current_url.lower()
+        if "/login" in current_url or "/challenge" in current_url:
+            raise RuntimeError(
+                "TikTok did not complete login. CAPTCHA, 2FA, suspicious-login checks, or headless detection may still be blocking access. "
+                "Confirm you are logged in in the browser or provide CAPTCHA_API_KEY."
+            )
     except TimeoutException as exc:
         raise RuntimeError(
             "TikTok login page did not load the expected fields. The site layout may have changed."
