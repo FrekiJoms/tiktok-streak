@@ -55,6 +55,30 @@ def has_working_captcha_key():
     return bool(api_key) and api_key != "api_key_ocacaptcha"
 
 
+def get_chrome_user_data_dir():
+    return os.getenv("CHROME_USER_DATA_DIR", "").strip()
+
+
+def get_chrome_profile_directory():
+    return os.getenv("CHROME_PROFILE_DIRECTORY", "").strip()
+
+
+def get_default_chrome_user_data_dir():
+    local_appdata = os.getenv("LOCALAPPDATA", "").strip()
+    if not local_appdata:
+        return ""
+    return os.path.join(local_appdata, "Google", "Chrome", "User Data")
+
+
+def should_use_existing_session():
+    return os.getenv("USE_EXISTING_SESSION", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def is_logged_in(browser):
+    current_url = browser.current_url.lower()
+    return "tiktok.com" in current_url and "/login" not in current_url and "/challenge" not in current_url
+
+
 def load_friends():
     if not os.path.exists(FRIENDS_CSV):
         return []
@@ -83,8 +107,34 @@ def init_browser():
 
     chrome_options = Options()
     chrome_options.add_argument("--disable-notifications")
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
     if is_headless_enabled():
         chrome_options.add_argument("--headless=new")
+
+    user_data_dir = get_chrome_user_data_dir()
+    profile_directory = get_chrome_profile_directory()
+
+    if profile_directory and not user_data_dir:
+        default_user_data_dir = get_default_chrome_user_data_dir()
+        if default_user_data_dir:
+            user_data_dir = default_user_data_dir
+
+    if user_data_dir:
+        if not os.path.isdir(user_data_dir):
+            raise RuntimeError(f"Chrome user data directory does not exist: {user_data_dir}")
+        chrome_options.add_argument(f"--user-data-dir={user_data_dir}")
+
+    if profile_directory:
+        profile_path = os.path.join(user_data_dir, profile_directory) if user_data_dir else profile_directory
+        if user_data_dir and not os.path.isdir(profile_path):
+            raise RuntimeError(
+                f"Chrome profile directory does not exist: {profile_directory}. "
+                f"Use a real folder name like 'Default' or 'Profile 1'."
+            )
+        chrome_options.add_argument(f"--profile-directory={profile_directory}")
     try:
         browser = webdriver.Chrome(options=chrome_options)
     except WebDriverException as exc:
@@ -92,11 +142,30 @@ def init_browser():
             "Chrome WebDriver could not start. Install Google Chrome and ensure Selenium can access a compatible driver."
         ) from exc
 
+    browser.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            """
+        },
+    )
+
     wait = WebDriverWait(browser, 20)
     return browser, wait
 
 
 def login_tiktok(browser, wait, username, password):
+    if should_use_existing_session():
+        browser.get("https://www.tiktok.com/messages?lang=en")
+        time.sleep(5)
+        if is_logged_in(browser):
+            print("Using existing TikTok browser session.")
+            return
+        raise RuntimeError(
+            "USE_EXISTING_SESSION is enabled, but this Chrome profile is not logged into TikTok."
+        )
+
     browser.get("https://www.tiktok.com/login/phone-or-email/email")
     try:
         wait.until(EC.presence_of_element_located((By.NAME, "username"))).send_keys(username)
@@ -136,8 +205,8 @@ def login_tiktok(browser, wait, username, password):
         current_url = browser.current_url.lower()
         if "/login" in current_url or "/challenge" in current_url:
             raise RuntimeError(
-                "TikTok did not complete login. CAPTCHA, 2FA, suspicious-login checks, or headless detection may still be blocking access. "
-                "Confirm you are logged in in the browser or provide CAPTCHA_API_KEY."
+                "TikTok did not complete login. CAPTCHA, 2FA, suspicious-login checks, or rate limiting may still be blocking access. "
+                "Use a real Chrome profile with USE_EXISTING_SESSION=true after logging in manually."
             )
     except TimeoutException as exc:
         raise RuntimeError(
